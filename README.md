@@ -2,6 +2,17 @@
 A Mozilla A-Frame component for loading [Gazebo's](http://gazebosim.org/)
 [Simulation Description Format (SDF)](http://sdformat.org/) models as components
 
+## Current Status
+
+Currently, this is in a very preliminary stage. While the ultimate goal is to
+eventually add support for all details of SDF implementation, but the way that
+the project is proceeding is by adding support for all models in the
+[Gazebo model database](http://models.gazebosim.org/) and its
+[source repository](https://bitbucket.org/osrf/gazebo_models).
+
+The ultimate test would be to test something analogous to a 3D printer's "Benchy"
+that fully tests all details of loading and simulationg an SDF model.
+
 ## Goals
 The primary goal for this project is to create a means to load SDF files
 directly into a Mozilla A-Frame simulation along with working physics based. The
