@@ -18,20 +18,29 @@ var TagHandler = Object.assign(Object.create(null), {
   handlers: {},
   use: function(node, context) {
     let ctx = this.before(node, context);
+    let handled = Array.from(node.childNodes)
+      .filter(child => "tagName" in child)
+      .filter(child => child.tagName in this.handlers || (console.log(child.tagName + " tag not supported") && false))
+      .reduce((current, child) => {
+        let childResult = this.handlers[child.tagName].use(child, ctx);
+        current[child.tagName] = child.tagName in current ?
+          current[child.tagName].concat([childResult]) :
+          [childResult];
+        return current;
+      }, Object.create(null));
     return this.after(
       node,
       ctx,
-      Array.from(node.childNodes)
-      .filter(child => child.tagName in handlers || (console.log(child.tagName + " tag not supported") && false))
-      .map(child => handlers[child.tagName].use(child, ctx)));
+      handled);
   }
 });
 
+// Using GZWeb I can probably lift some parts awayy
 var VisualGeometryCylinder = Object.assign(Object.create(TagHandler), {
   use: function(node, context) {
     var elem = document.createElement("a-cylinder");
     elem.setAttribute("radius", node.querySelector("radius").textContent);
-    elem.setAttribute("length", node.querySelector("length").textContent);
+    elem.setAttribute("height", node.querySelector("length").textContent);
     return elem;
   }
 });
@@ -40,6 +49,7 @@ var VisualGeometrySphere = Object.assign(Object.create(TagHandler), {
   use: function(node, context) {
     var elem = document.createElement("a-sphere");
     elem.setAttribute("radius", node.querySelector("radius").textContent);
+    return elem;
   }
 });
 
@@ -50,7 +60,7 @@ var VisualGeometryMesh = Object.assign(Object.create(TagHandler), {
     let elem = document.createElement("a-collada-model");
 
     // Handle model:// URI resolution
-    elem.setAttribute("src", resolveModelUri(uri));
+    elem.setAttribute("src", resolveModelUri(uri, context));
     
     return elem;
   }
@@ -61,36 +71,47 @@ var VisualGeometry = Object.assign(Object.create(TagHandler), {
     mesh: VisualGeometryMesh,
     sphere: VisualGeometrySphere,
     cylinder: VisualGeometryCylinder
+  },
+  after: function(node, context, childResults) {
+    var resultKey = Object.keys(childResults)[0];
+    return childResults[resultKey][0];
+  }
+});
+
+var Numbers = Object.assign(Object.create(TagHandler), {
+  use: function(node, context) {
+    return node.textContent.split(" ")
+	  .map(parseFloat);
   }
 });
 
 var Visual = Object.assign(Object.create(TagHandler), {
-  use: function(node, context) {
-    // Find the geometry first
-    let elem = VisualGeometry.use(node.querySelector("geometry"), context);
-    // Find the pose second
-    let pose = node.querySelector("pose")
-      .textContent
-      .split(" ")
-      .map(parseFloat);
-
-    elem.setAttribute("position", visualPose.slice(0, 3).join(" "));
-  
+  handlers: {
+    "geometry": VisualGeometry,
+    "pose": Numbers
+  },
+  after: function(node, context, childResults) {
+    // Use Three.js directly for visual, rather than making sub-objects
+    let elem = childResults.geometry[0];
+    let pose = childResults.pose[0];
+    let elemPos = elem.object3D.position;
+    elemPos.set.apply(elemPos, pose.slice(0, 3));
     // Convert roll, pitch, and yaw from radians to degrees
     // TODO is re-ordering these necessary? A-Frame docs says this is Pitch, Yaw, and Roll
-    elem.setAttribute("rotation", visualPose
+    elem.setAttribute("rotation", pose
       .slice(3, 6)
       .map(angle => angle * 180 / Math.PI)
       .join(" "));
-  
-    context.elem.appendChild(elem);
+    var position = elem.getAttribute("position");
+    return elem;
   }
 });
 
 var Link = Object.assign(Object.create(TagHandler), {
   before: function(node, context) {
-    var linkContext = new Object();
-    linkContext.elem = document.createElement("a-entity");
+    var linkContext = Object.create(null);
+    linkContext.up = context;
+    linkContext.el = document.createElement("a-entity");
     return linkContext;
   },
   handlers: {
@@ -98,6 +119,12 @@ var Link = Object.assign(Object.create(TagHandler), {
     // inertial: Inertial,
     // collision: Collision,
     visual: Visual
+  },
+  after: function(node, context, childResults) {
+    let elem = document.createElement("a-entity");
+    if("visual" in childResults)
+      elem.appendChild(childResults.visual[0]);
+    return elem;
   }
 });
 
@@ -119,15 +146,8 @@ var Model = Object.assign(Object.create(TagHandler), {
   before: function(node, context) {
     var modelContext = new Object();
     modelContext.up = context;
-    modelContext.elem = document.createElement("a-entity");
 
     // resolve model:// URI to Gazebo repo, here for expedience
-    if(!context.up)
-      modelContext.modelRoot = "http://models.gazebosim.org/";
-
-    if(context) {
-      context.down.push(modelContext);
-    }
     if("modelNames" in context) {
       context.models[node.getAttribute("name")];
     }
@@ -138,21 +158,26 @@ var Model = Object.assign(Object.create(TagHandler), {
     // TODO implement joints
     // joint: Joint
   },
-  after: function(node, modelContext) {
-    if("up" in modelContext) {
-      let context = modelContext.up;
-      if("elem" in context) {
-        context.elem.appendChild(modelContext.elem);
-      }
-    }
+  after: function(node, modelContext, childResults) {
+    // Need to attach all links
+    var elem = document.createElement("a-entity");
+    childResults.link.forEach(childElem => elem.appendChild(childElem));
+    return elem;
+  }
+});
+
+AFRAME.registerSystem('sdf-root', {
+  schema: {
+    type: 'string', default: 'models/'
+  },
+  init: function() {
   }
 });
 
 AFRAME.registerComponent('sdf', {
   // The rest of the information should be in the SDF file
   schema: {
-    uri: { type: 'asset' },
-    modelroot: { type: 'string', default: 'http://models.gazebosim.org/' }
+    type: 'asset'
   },
   init: function() {
     this.namedElems = new Map();
@@ -160,23 +185,33 @@ AFRAME.registerComponent('sdf', {
   },
   update: function(oldData) {
     // Use the Fetch API to get the model
-    if("uri" in oldData || "modelroot" in oldData) {
+    if(oldData && ("uri" in oldData || "modelroot" in oldData)) {
       console.log("Weird behavior might be caused by changing src mid-simulation ...");
       return;
     }
-    this.modelRoot = this.data.modelroot;
+    this.modelRoot = this.el.sceneEl.systems["sdf-root"].data;
     // Load the full SDF document with includes resolved
     // Resolve the model:// URI if necessary
-    this.loadSdfDocument(resolveModelUri(this.data.uri, this));
+    this.loadSdfDocument(resolveModelUri(this.data, this));
   },
   loadSdfDocument: function(url) {
     // Return a promise resolving to a DOM model
-    var request = fetch(url, {
-      method: "GET"
+    var request = fetch(new Request(url), {
+      method: "GET",
+      mode: "same-origin"
     })
     .then(function(response) {
       // Convert to text first
       console.log("Getting response as text");
+      console.log(response.ok);
+      console.log(response.status);
+      for(let entry in response) {
+        console.log(entry + ": " +  response[entry]);
+      }
+      console.log("Headers");
+      for(let pair of response.headers) {
+        console.log(pair[0] + ": " + pair[1]);
+      }
       return response.text();
     })
     .then(this.validateDoc.bind(this))
@@ -186,17 +221,14 @@ AFRAME.registerComponent('sdf', {
       return new DOMParser().parseFromString(text, "application/xml");
     })
     .then(this.processSdfDocument.bind(this)).catch(function(e) {
+      console.log(e.message);
       console.log("Error during promise");
     });
   },
   // Creates an A-Frame entity element equivalent to the provided model
-  processSdfDocument: function(context, doc) {
+  processSdfDocument: function(doc) {
     // find the first model in the document
-    if(this.validateDoc(doc)) {
-      Model.use(doc.documentElement.querySelector("model"), this);
-    } else {
-      alert("SDF file failed validation");
-    }
+    this.el.appendChild(Model.use(doc.documentElement.querySelector("model"), this));
   },
   validateDoc: function(text) {
     // TODO do validation all in one place
